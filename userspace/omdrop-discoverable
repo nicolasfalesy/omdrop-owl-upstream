@@ -166,9 +166,9 @@ exclusive_up() {  # STA PHY FREQ...
   for f in "$@"; do
     iw dev "$IBSS" ibss join omdrop "$f" HT20 fixed-freq "$AWDL_BSSID" beacon-interval 10000 >&2 || continue
     # mac80211 scans the channel once before it starts the cell.
-    for _ in $(seq 40); do
+    for _ in $(seq 200); do
       iw dev "$IBSS" link 2>/dev/null | grep -q '^Joined IBSS' && { echo "$f"; return 0; }
-      sleep 0.25
+      sleep 0.05
     done
     iw dev "$IBSS" ibss leave 2>/dev/null
   done
@@ -225,7 +225,10 @@ cmd_status() {
 # randomise their AWDL address, so nothing here remembers one.
 cmd_peers() {
   [ -r "$OWL_LOG" ] || die "no OWL log at $OWL_LOG; is the radio up?" 4
-  grep -oE '(add|remove) peer [0-9a-f:]+' "$OWL_LOG" | awk '
+  # "|| true": with no peer yet grep exits 1, pipefail made that the
+  # command's status, and `omdrop send` gave up at once instead of waiting
+  # for the phone to wake (2026-10-10).
+  { grep -oE '(add|remove) peer [0-9a-f:]+' "$OWL_LOG" || true; } | awk '
     { n = split($3, o, ":"); mac = ""
       for (i = 1; i <= n; i++) mac = mac (i > 1 ? ":" : "") sprintf("%02s", o[i])
       gsub(/ /, "0", mac)
@@ -435,20 +438,36 @@ cmd_start() {
   # it for the whole window and the next `stop` would wait forever.
   setsid "$OWL_BIN" -i "$MON" -c "$chan" -N -S "$strategy" "${owl_extra[@]}" -v > "$OWL_LOG" 2>&1 < /dev/null 9>&- &
   echo $! > "$RUN/owl.pid"
-  for _ in $(seq 20); do ip link show "$IF" >/dev/null 2>&1 && break; sleep 0.5; done
+  # 50 ms polls: OWL creates it in well under a second, and 0.5 s steps cost up to 0.5 s.
+  for _ in $(seq 200); do ip link show "$IF" >/dev/null 2>&1 && break; sleep 0.05; done
   if ! ip link show "$IF" >/dev/null 2>&1; then
     local why; why=$(tail -1 "$OWL_LOG" 2>/dev/null)
     cmd_stop owl-failed >/dev/null
     die "AWDL didn't come up: ${why:-OWL exited}" 4
   fi
   nmcli device set "$IF" managed no >/dev/null 2>&1
+  # No duplicate address detection on awdl0: its link-local comes from our own
+  # MAC on a link we alone create, and DAD held it "tentative" for about 1.2 s
+  # of every start (measured 2026-10-10). OWL brings awdl0 up itself, so the
+  # address exists before accept_dad=0 can apply; re-add it with nodad instead.
+  sysctl -qw "net.ipv6.conf.$IF.accept_dad=0" 2>/dev/null
   ip link set "$IF" up
+  for _ in $(seq 40); do
+    ll=$(ip -6 addr show dev "$IF" scope link tentative 2>/dev/null | awk '/inet6/ {print $2; exit}')
+    [ -n "$ll" ] && break
+    ip -6 addr show dev "$IF" scope link 2>/dev/null | grep -q inet6 && break
+    sleep 0.05
+  done
+  if [ -n "${ll:-}" ]; then
+    ip -6 addr del "$ll" dev "$IF" 2>/dev/null
+    ip -6 addr add "$ll" dev "$IF" scope link nodad 2>/dev/null
+  fi
   # awdl0's link-local stays "tentative" during duplicate address detection,
   # and omdrop's receiver refuses to start without a usable one.
-  for _ in $(seq 20); do
+  for _ in $(seq 200); do
     ip -6 addr show dev "$IF" scope link | grep -q inet6 \
       && ! ip -6 addr show dev "$IF" scope link | grep -q tentative && break
-    sleep 0.5
+    sleep 0.05
   done
 
   setsid "$SELF" __supervise > /dev/null 2>&1 < /dev/null 9>&- &
